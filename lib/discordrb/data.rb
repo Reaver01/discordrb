@@ -547,20 +547,28 @@ module Discordrb
     # @param role [Role, Array<Role>] The role(s) to add.
     def add_role(role)
       role_ids = role_id_array(role)
-      old_role_ids = @roles.map(&:id)
-      new_role_ids = (old_role_ids + role_ids).uniq
 
-      API::Server.update_member(@bot.token, @server.id, @user.id, roles: new_role_ids)
+      if role_ids.count == 1
+        API::Server.add_member_role(@bot.token, @server.id, @user.id, role_ids[0])
+      else
+        old_role_ids = @roles.map(&:id)
+        new_role_ids = (old_role_ids + role_ids).uniq
+        API::Server.update_member(@bot.token, @server.id, @user.id, roles: new_role_ids)
+      end
     end
 
     # Removes one or more roles from this member.
     # @param role [Role, Array<Role>] The role(s) to remove.
     def remove_role(role)
-      old_role_ids = @roles.map(&:id)
       role_ids = role_id_array(role)
-      new_role_ids = old_role_ids.reject { |i| role_ids.include?(i) }
 
-      API::Server.update_member(@bot.token, @server.id, @user.id, roles: new_role_ids)
+      if role_ids.count == 1
+        API::Server.remove_member_role(@bot.token, @server.id, @user.id, role_ids[0])
+      else
+        old_role_ids = @roles.map(&:id)
+        new_role_ids = old_role_ids.reject { |i| role_ids.include?(i) }
+        API::Server.update_member(@bot.token, @server.id, @user.id, roles: new_role_ids)
+      end
     end
 
     # Server deafens this member.
@@ -609,7 +617,7 @@ module Discordrb
     # @!visibility private
     def update_roles(roles)
       @roles = roles.map do |role|
-        role.is_a?(Role) ? role : @server.role(role.to_i)
+        @server.role(role)
       end
     end
 
@@ -1154,6 +1162,13 @@ module Discordrb
       @type == 3
     end
 
+    # @return [true, false] whether or not this channel is the default channel
+    def default_channel?
+      server.default_channel == self
+    end
+
+    alias_method :default?, :default_channel?
+
     # Sends a message to this channel.
     # @param content [String] The content to send. Should not be longer than 2000 characters or it will result in an error.
     # @param tts [true, false] Whether or not this message should be sent using Discord text-to-speech.
@@ -1319,7 +1334,9 @@ module Discordrb
     # in that channel. For a text channel, it will return all online members that have permission to read it.
     # @return [Array<Member>] the users in this channel
     def users
-      if text?
+      if default_channel?
+        @server.online_members(include_idle: true)
+      elsif text?
         @server.online_members(include_idle: true).select { |u| u.can_read_messages? self }
       elsif voice?
         @server.voice_states.map { |id, voice_state| @server.member(id) if !voice_state.voice_channel.nil? && voice_state.voice_channel.id == @id }.compact
@@ -1333,19 +1350,20 @@ module Discordrb
     #   start at the current message.
     # @param after_id [Integer] The ID of the oldest message the retrieval should start at, or nil if it should start
     #   as soon as possible with the specified amount.
+    # @param around_id [Integer] The ID of the message retrieval should start from, reading in both directions
     # @example Count the number of messages in the last 50 messages that contain the letter 'e'.
     #   message_count = channel.history(50).count {|message| message.content.include? "e"}
     # @return [Array<Message>] the retrieved messages.
-    def history(amount, before_id = nil, after_id = nil)
-      logs = API::Channel.messages(@bot.token, @id, amount, before_id, after_id)
+    def history(amount, before_id = nil, after_id = nil, around_id = nil)
+      logs = API::Channel.messages(@bot.token, @id, amount, before_id, after_id, around_id)
       JSON.parse(logs).map { |message| Message.new(message, @bot) }
     end
 
     # Retrieves message history, but only message IDs for use with prune
     # @note For internal use only
     # @!visibility private
-    def history_ids(amount, before_id = nil, after_id = nil)
-      logs = API::Channel.messages(@bot.token, @id, amount, before_id, after_id)
+    def history_ids(amount, before_id = nil, after_id = nil, around_id = nil)
+      logs = API::Channel.messages(@bot.token, @id, amount, before_id, after_id, around_id)
       JSON.parse(logs).map { |message| message['id'].to_i }
     end
 
@@ -1410,9 +1428,10 @@ module Discordrb
     # @param max_age [Integer] How many seconds this invite should last.
     # @param max_uses [Integer] How many times this invite should be able to be used.
     # @param temporary [true, false] Whether membership should be temporary (kicked after going offline).
+    # @param unique [true, false] If true, Discord will always send a unique invite instead of possibly re-using a similar one
     # @return [Invite] the created invite.
-    def make_invite(max_age = 0, max_uses = 0, temporary = false)
-      response = API::Channel.create_invite(@bot.token, @id, max_age, max_uses, temporary)
+    def make_invite(max_age = 0, max_uses = 0, temporary = false, unique = false)
+      response = API::Channel.create_invite(@bot.token, @id, max_age, max_uses, temporary, unique)
       Invite.new(JSON.parse(response), @bot)
     end
 
@@ -1427,7 +1446,7 @@ module Discordrb
 
     # Creates a Group channel
     # @param user_ids [Array<Integer>] Array of user IDs to add to the new group channel (Excluding
-    # the recipient of the PM channel).
+    #   the recipient of the PM channel).
     # @return [Channel] the created channel.
     def create_group(user_ids)
       raise 'Attempted to create group channel on a non-pm channel!' unless pm?
@@ -1919,7 +1938,7 @@ module Discordrb
     end
 
     # Reacts to a message
-    # @param [String, #to_reaction] the unicode emoji, Emoji, or GlobalEmoji
+    # @param reaction [String, #to_reaction] the unicode emoji, Emoji, or GlobalEmoji
     def create_reaction(reaction)
       reaction = reaction.to_reaction if reaction.respond_to?(:to_reaction)
       API::Channel.create_reaction(@bot.token, @channel.id, @id, reaction)
@@ -1929,7 +1948,7 @@ module Discordrb
     alias_method :react, :create_reaction
 
     # Returns the list of users who reacted with a certain reaction
-    # @param [String, #to_reaction] the unicode emoji, Emoji, or GlobalEmoji
+    # @param reaction [String, #to_reaction] the unicode emoji, Emoji, or GlobalEmoji
     # @return [Array<User>] the users who used this reaction
     def reacted_with(reaction)
       reaction = reaction.to_reaction if reaction.respond_to?(:to_reaction)
@@ -1938,15 +1957,15 @@ module Discordrb
     end
 
     # Deletes a reaction made by a user on this message
-    # @param [User, #resolve_id] the user who used this reaction
-    # @param [String, #to_reaction] the reaction to remove
+    # @param user [User, #resolve_id] the user who used this reaction
+    # @param reaction [String, #to_reaction] the reaction to remove
     def delete_reaction(user, reaction)
       reaction = reaction.to_reaction if reaction.respond_to?(:to_reaction)
       API::Channel.delete_user_reaction(@bot.token, @channel.id, @id, reaction, user.resolve_id)
     end
 
     # Delete's this clients reaction on this message
-    # @param [String, #to_reaction] the reaction to remove
+    # @param reaction [String, #to_reaction] the reaction to remove
     def delete_own_reaction(reaction)
       reaction = reaction.to_reaction if reaction.respond_to?(:to_reaction)
       API::Channel.delete_own_reaction(@bot.token, @channel.id, @id, reaction)
@@ -2341,6 +2360,30 @@ module Discordrb
 
     alias_method :online_users, :online_members
 
+    # Returns the amount of members that are candidates for pruning
+    # @param days [Integer] the number of days to consider for inactivity
+    # @return [Integer] number of members to be removed
+    # @raise [ArgumentError] if days is not between 1 and 30 (inclusive)
+    def prune_count(days)
+      raise ArgumentError, 'Days must be between 1 and 30' unless days.between?(1, 30)
+
+      response = JSON.parse API::Server.prune_count(@bot.token, @id, days)
+      response['pruned']
+    end
+
+    # Prunes (kicks) an amount of members for inactivity
+    # @param days [Integer] the number of days to consider for inactivity (between 1 and 30)
+    # @return [Integer] the number of members removed at the end of the operation
+    # @raise [ArgumentError] if days is not between 1 and 30 (inclusive)
+    def begin_prune(days)
+      raise ArgumentError, 'Days must be between 1 and 30' unless days.between?(1, 30)
+
+      response = JSON.parse API::Server.begin_prune(@bot.token, @id, days)
+      response['pruned']
+    end
+
+    alias_method :prune, :begin_prune
+
     # @return [Array<Channel>] an array of text channels on this server
     def text_channels
       @channels.select(&:text?)
@@ -2476,12 +2519,18 @@ module Discordrb
       Channel.new(JSON.parse(response), @bot)
     end
 
-    # Creates a role on this server which can then be modified. It will be initialized (on Discord's side)
-    # with the regular role defaults the client uses, i. e. name is "new role", permissions are the default,
-    # colour is the default etc.
+    # Creates a role on this server which can then be modified. It will be initialized
+    # with the regular role defaults the client uses unless specified, i. e. name is "new role",
+    # permissions are the default, colour is the default etc.
+    # @param name [String] Name of the role to create
+    # @param colour [ColourRGB] The roles colour
+    # @param hoist [true, false]
+    # @param mentionable [true, false]
+    # @param packed_permissions [Integer] The packed permissions to write.
     # @return [Role] the created role.
-    def create_role
-      response = API::Server.create_role(@bot.token, @id)
+    def create_role(name: 'new role', colour: 0, hoist: false, mentionable: false, packed_permissions: 104_324_161)
+      response = API::Server.create_role(@bot.token, @id, name, colour, hoist, mentionable, packed_permissions)
+
       role = Role.new(JSON.parse(response), @bot, self)
       @roles << role
       role
